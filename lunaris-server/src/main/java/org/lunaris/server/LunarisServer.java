@@ -1,55 +1,120 @@
+
 package org.lunaris.server;
 
 import org.lunaris.common.config.ServerConfig;
-import org.lunaris.network.NetworkService;
-import org.lunaris.protocol.BedrockProtocol;
+import org.lunaris.common.lifecycle.ServerLifecycle;
+import org.lunaris.common.lifecycle.ServerState;
+import org.lunaris.common.logging.LunarisLogger;
+import org.lunaris.common.scheduler.ServerScheduler;
+import org.lunaris.server.module.ModuleManager;
 
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.logging.Logger;
 
 public final class LunarisServer {
-    private static final Logger LOGGER = Logger.getLogger("Lunaris");
+
+    private final LunarisLogger logger =
+            new LunarisLogger("Lunaris");
 
     private final ServerConfig config;
-    private final NetworkService network = new NetworkService();
-    private final AtomicBoolean stopped = new AtomicBoolean(false);
+    private final ServerLifecycle lifecycle;
+    private final ServerScheduler scheduler;
+    private final ModuleManager moduleManager;
+
+    private final CountDownLatch shutdownLatch =
+            new CountDownLatch(1);
+
+    private final AtomicBoolean shutdownStarted =
+            new AtomicBoolean(false);
 
     public LunarisServer(ServerConfig config) {
         this.config = config;
+        this.lifecycle = new ServerLifecycle();
+        this.scheduler = new ServerScheduler();
+        this.moduleManager = new ModuleManager();
     }
 
     public void start() {
-        LOGGER.info("Starting Lunaris " + LunarisBuild.VERSION);
-        LOGGER.info("Target Bedrock: " + BedrockProtocol.GAME_VERSION
-                + " (protocol " + BedrockProtocol.PROTOCOL_VERSION + ")");
-        LOGGER.info("Server name: " + config.name());
-        LOGGER.info("Configured bind address: " + config.host() + ":" + config.port());
-        LOGGER.info("Configured transport: " + config.transport());
-        LOGGER.info("Maximum players: " + config.maxPlayers());
-
-        // Networking is deliberately not started until a real NetherNet transport exists.
-        LOGGER.info("Foundation startup complete. No Bedrock listener is active yet.");
-        LOGGER.info("Press Ctrl+C to stop Lunaris.");
-
         try {
-            Thread.currentThread().join();
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            shutdown();
+            lifecycle.transition(ServerState.STARTING);
+
+            logger.info("Starting Lunaris Server...");
+            logger.info("Initializing server components...");
+
+            moduleManager.initialize();
+
+            lifecycle.transition(ServerState.RUNNING);
+
+            logger.info("Lunaris is now running.");
+            logger.info("Waiting for connections...");
+
+            Runtime.getRuntime().addShutdownHook(
+                    new Thread(this::stop, "Lunaris-Shutdown")
+            );
+
+        } catch (Exception exception) {
+            logger.error(
+                    "Failed to start Lunaris: " + exception.getMessage()
+            );
+
+            lifecycle.transition(ServerState.FAILED);
+            cleanup();
+
+            shutdownLatch.countDown();
         }
     }
 
-    public void shutdown() {
-        if (!stopped.compareAndSet(false, true)) {
+    public void stop() {
+        if (!shutdownStarted.compareAndSet(false, true)) {
             return;
         }
 
-        LOGGER.info("Stopping Lunaris...");
-        try {
-            network.close();
-        } catch (Exception exception) {
-            LOGGER.warning("Network shutdown reported an issue: " + exception.getMessage());
+        ServerState currentState = lifecycle.getState();
+
+        if (currentState == ServerState.STOPPED) {
+            shutdownLatch.countDown();
+            return;
         }
-        LOGGER.info("Lunaris stopped.");
+
+        if (currentState == ServerState.RUNNING
+                || currentState == ServerState.STARTING) {
+            lifecycle.transition(ServerState.STOPPING);
+        }
+
+        logger.info("Stopping Lunaris Server...");
+
+        cleanup();
+
+        if (lifecycle.getState() == ServerState.STOPPING) {
+            lifecycle.transition(ServerState.STOPPED);
+        }
+
+        logger.info("Lunaris Server stopped.");
+
+        shutdownLatch.countDown();
+    }
+
+    private void cleanup() {
+        logger.info("Stopping scheduler...");
+        scheduler.shutdown();
+
+        logger.info("Shutting down modules...");
+        moduleManager.shutdown();
+    }
+
+    public void awaitShutdown() throws InterruptedException {
+        shutdownLatch.await();
+    }
+
+    public ServerState getState() {
+        return lifecycle.getState();
+    }
+
+    public ServerScheduler getScheduler() {
+        return scheduler;
+    }
+
+    public ModuleManager getModuleManager() {
+        return moduleManager;
     }
 }
